@@ -750,17 +750,15 @@ GetFieldRes hashTypeGetValue(redisDb *db, robj *o, sds field, unsigned char **vs
     propagateHashFieldDeletion(db, key, field, sdslen(field));
 
     /* If the field is the last one in the hash, then the hash will be deleted */
-    res = GETF_EXPIRED;
     robj *keyObj = createStringObject(key, sdslen(key));
-    if (!(hfeFlags & HFE_LAZY_NO_NOTIFICATION))
-        notifyKeyspaceEvent(NOTIFY_HASH, "hexpired", keyObj, db->id);
-    if ((hashTypeLength(o, 0) == 0) && (!(hfeFlags & HFE_LAZY_AVOID_HASH_DEL))) {
-        if (!(hfeFlags & HFE_LAZY_NO_NOTIFICATION))
-            notifyKeyspaceEvent(NOTIFY_GENERIC, "del", keyObj, db->id);
+    if (hashTypeLength(o, 0) == 0) {
+        notifyKeyspaceEvent(NOTIFY_GENERIC, "del", keyObj, db->id);
         dbDelete(db,keyObj);
         res = GETF_EXPIRED_HASH;
+    } else {
+        notifyKeyspaceEvent(NOTIFY_HASH, "hexpired", keyObj, db->id);
+        res = GETF_EXPIRED;
     }
-    signalModifiedKey(NULL, db, keyObj);
     decrRefCount(keyObj);
     return res;
 }
@@ -1154,7 +1152,12 @@ void hashTypeSetExDone(HashTypeSetEx *ex) {
     /* Notify keyspace event, update dirty count and update global HFE DS */
     if (ex->fieldDeleted + ex->fieldUpdated > 0) {
 
-        server.dirty += ex->fieldDeleted + ex->fieldUpdated;
+        if (ex->c) {
+            server.dirty += ex->fieldDeleted + ex->fieldUpdated;
+            signalModifiedKey(ex->c, ex->db, ex->key);
+            notifyKeyspaceEvent(NOTIFY_HASH, ex->fieldDeleted ? "hexpired" : "hexpire",
+                                ex->key, ex->db->id);
+        }
         if (ex->fieldDeleted && hashTypeLength(ex->hashObj, 0) == 0) {
             dbDelete(ex->db,ex->key);
             signalModifiedKey(ex->c, ex->db, ex->key);
@@ -1785,10 +1788,11 @@ static ExpireAction hashTypeActiveExpire(eItem _hashObj, void *ctx) {
     ActiveExpireCtx *activeExpireCtx = (ActiveExpireCtx *) ctx;
     sds keystr = NULL;
     ExpireInfo info = {0};
+    ExpireAction ret = ACT_STOP_ACTIVE_EXP;
 
     /* If no more quota left for this callback, stop */
     if (activeExpireCtx->fieldsToExpireQuota == 0)
-        return ACT_STOP_ACTIVE_EXP;
+        return ret;
 
     if (hashObj->encoding == OBJ_ENCODING_LISTPACK_EX) {
         info = (ExpireInfo){
@@ -1824,30 +1828,28 @@ static ExpireAction hashTypeActiveExpire(eItem _hashObj, void *ctx) {
     /* Update quota left */
     activeExpireCtx->fieldsToExpireQuota -= info.itemsExpired;
 
-    /* In some cases, a field might have been deleted without updating the global DS.
-     * As a result, active-expire might not expire any fields, in such cases,
-     * we don't need to send notifications or perform other operations for this key. */
-    if (info.itemsExpired) {
-        robj *key = createStringObject(keystr, sdslen(keystr));
-        notifyKeyspaceEvent(NOTIFY_HASH,"hexpired",key,activeExpireCtx->db->id);
+    /* If hash has no more fields to expire, remove it from HFE DB */
+    robj *key = createStringObject(keystr, sdslen(keystr));
+    if (info.nextExpireTime == EB_EXPIRE_TIME_INVALID) {
         if (hashTypeLength(hashObj, 0) == 0) {
             dbDelete(activeExpireCtx->db, key);
             notifyKeyspaceEvent(NOTIFY_GENERIC,"del",key,activeExpireCtx->db->id);
+        } else {
+            notifyKeyspaceEvent(NOTIFY_HASH,"hexpired",key,activeExpireCtx->db->id);
         }
-        server.dirty++;
-        signalModifiedKey(NULL, activeExpireCtx->db, key);
-        decrRefCount(key);
-    }
-
-    /* If hash has no more fields to expire, remove it from HFE DB */
-    if (info.nextExpireTime == EB_EXPIRE_TIME_INVALID) {
-        return ACT_REMOVE_EXP_ITEM;
+        ret = ACT_REMOVE_EXP_ITEM;
     } else {
         /* Hash has more fields to expire. Update next expiration time of the hash
          * and indicate to add it back to global HFE DS */
         ebSetMetaExpTime(hashGetExpireMeta(hashObj), info.nextExpireTime);
-        return ACT_UPDATE_EXP_ITEM;
+        notifyKeyspaceEvent(NOTIFY_HASH,"hexpired",key,activeExpireCtx->db->id);
+        ret = ACT_UPDATE_EXP_ITEM;
     }
+
+    server.dirty++;
+    signalModifiedKey(NULL, activeExpireCtx->db, key);
+    decrRefCount(key);
+    return ret;
 }
 
 /* Return the next/minimum expiry time of the hash-field. This is useful if a
